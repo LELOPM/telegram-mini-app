@@ -8,6 +8,10 @@
 -- 6. Decreases inventory
 -- 7. Clears user's cart
 -- All in a single atomic transaction
+--
+-- Lock ordering: both cart_items cursors iterate ORDER BY product_id to
+-- guarantee a consistent lock acquisition order across concurrent
+-- transactions and prevent deadlocks when two checkouts share products.
 
 CREATE OR REPLACE FUNCTION public.create_order_from_cart(
     p_telegram_user_id BIGINT,
@@ -37,33 +41,40 @@ BEGIN
     IF p_telegram_user_id IS NULL OR p_telegram_user_id <= 0 THEN
         RAISE EXCEPTION 'Invalid telegram_user_id';
     END IF;
-    
+
     IF p_checkout_id IS NULL THEN
         RAISE EXCEPTION 'Invalid checkout_id';
     END IF;
-    
+
     IF p_customer_name IS NULL OR p_customer_name = '' THEN
         RAISE EXCEPTION 'Customer name is required';
     END IF;
-    
+
     IF p_phone IS NULL OR p_phone = '' THEN
         RAISE EXCEPTION 'Phone is required';
     END IF;
-    
+
     IF p_delivery_address IS NULL OR p_delivery_address = '' THEN
         RAISE EXCEPTION 'Delivery address is required';
     END IF;
 
     -- Check if checkout_id already exists (duplicate submission protection)
+    -- Note: the real guarantee is the UNIQUE index on orders.checkout_id
+    -- (orders_checkout_id_key) — this check just gives a friendlier error
+    -- message before hitting that constraint.
     IF EXISTS (SELECT 1 FROM public.orders WHERE checkout_id = p_checkout_id) THEN
         RAISE EXCEPTION 'Duplicate checkout_id - order already exists';
     END IF;
 
-    -- Lock the user's cart items for update to prevent concurrent modifications
+    -- Lock the user's cart items for update to prevent concurrent modifications.
+    -- ORDER BY product_id ensures every transaction acquires product locks
+    -- in the same order, preventing deadlocks between concurrent checkouts
+    -- that share products.
     FOR v_cart_item IN
         SELECT ci.id, ci.product_id, ci.quantity
         FROM public.cart_items ci
         WHERE ci.telegram_user_id = p_telegram_user_id
+        ORDER BY ci.product_id
         FOR UPDATE
     LOOP
         -- Get product details with row lock to prevent concurrent stock changes
@@ -85,7 +96,7 @@ BEGIN
 
         -- Validate stock
         IF v_product.stock < v_cart_item.quantity THEN
-            RAISE EXCEPTION 'Insufficient stock for product % (requested: %, available: %)', 
+            RAISE EXCEPTION 'Insufficient stock for product % (requested: %, available: %)',
                 v_product.name, v_cart_item.quantity, v_product.stock;
         END IF;
 
@@ -130,11 +141,14 @@ BEGIN
         now()
     ) RETURNING id INTO v_order_id;
 
-    -- Create order_items and clear cart in same transaction
+    -- Create order_items and clear cart in same transaction.
+    -- Same ORDER BY product_id, kept consistent with the locking loop above
+    -- even though this second pass doesn't re-lock products.
     FOR v_cart_item IN
         SELECT ci.id, ci.product_id, ci.quantity
         FROM public.cart_items ci
         WHERE ci.telegram_user_id = p_telegram_user_id
+        ORDER BY ci.product_id
     LOOP
         -- Get product details again for order_item
         SELECT p.name, p.price
